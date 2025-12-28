@@ -41,7 +41,6 @@ from functools import reduce
 import collections
 import heapq
 import pickle
-import json
 
 
 # Regex for coarse tokenization
@@ -103,7 +102,7 @@ def train_bpe(
     # The number of merges is the max vocabulary size minus the number of initial tokens.
     n_merges = vocab_size - n_initial_tokens
 
-    #print("Merge: start")
+    print("Merge: start")
     start_time = time.time()
     for i in range(n_initial_tokens, n_initial_tokens + n_merges):
         if not pair_heap:
@@ -142,8 +141,8 @@ def train_bpe(
         ):
             print(f"{i - n_initial_tokens + 1}/{n_merges} merges completed (merge runtime: {time.time() - start_time:.2f} seconds)")
 
-    #print(f"Merges completed in {time.time() - start_time:.2f}s")
-    print(f"Training completed in {time.time() - train_start_time:.2f}s")
+    print(f"Merge: completed in {time.time() - start_time:.2f}s")
+    print(f"Training completed in {time.time() - train_start_time:.2f} seconds")
 
     #print(f"vocab:\n{vocab}")
     #print(f"merges:\n{merges}")
@@ -174,7 +173,11 @@ def pre_tokenize(input_path: str,
     """
     num_processes = mp.cpu_count()
     #print(f"num_processes: {num_processes}")
+    # Restarts the worker process after every task, clearing all its held RAM
+    # This is needed to for large dataset like the OpenWebText.
     pool = mp.Pool(processes=num_processes)
+    #pool = mp.Pool(processes=num_processes, maxtasksperchild=1)
+    print(f"Pre_tokenization: {num_processes} processes have been launched.")
     chunk_freqs = []
     if special_tokens:
         # Join escaped tokens with "|" and compile the regex
@@ -185,11 +188,17 @@ def pre_tokenize(input_path: str,
         special_pattern = None
 
     with open(input_path, "rb") as f:
+        # We can adjust the desired_num_chunks argument in find_chunk_boundaries()
+        # to better use the CPU cores.
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        n_chunks = len(boundaries) - 1
+        print(f"Pre-tokenization: n_chunks: {n_chunks}")
 
         # Using zip and slicing to iterate through pairs of boundaries.
         # So, the start, end are boundaries[0], boundaries[1] and so on.
+        chunk_index = 0
         for start, end in zip(boundaries[:-1], boundaries[1:]):
+            chunk_index += 1
             f.seek(start)
             chunk_bytes = f.read(end - start)
             chunk_str = chunk_bytes.decode("UTF-8", errors="ignore")
@@ -197,10 +206,13 @@ def pre_tokenize(input_path: str,
             # In each process, the chunk is pre-tokenized. A dictionary from
             # pre-tokens to their frequencies is returned.
             # A list of frequency dictionaries is collected from all processes.
-            chunk_freqs.append(pool.apply_async(pre_tokenize_chunk, (chunk_str, special_pattern)))
+            # When the chunk number is larger than the processes number (CPU core number),
+            # pool.apply_async() add a task to the internal task queue of the pool.
+            # The workers will grab the tasks when they become idle.
+            chunk_freqs.append(pool.apply_async(pre_tokenize_chunk, (chunk_str, special_pattern, chunk_index)))
 
-    pool.close()
-    pool.join()
+    #pool.close()
+    #pool.join()
 
     # Collect and merge partial results.
     # chunk_freqs is a list of dictionaries mapping pre-tokens to their frequencies.
@@ -213,7 +225,13 @@ def pre_tokenize(input_path: str,
     freq_dicts = [res.get() for res in chunk_freqs]
     # merge_freq_dicts() merges {} into freq_dicts.
     # Then it merges the next item in the freq_dicts into the last result.
-    combined_freqs = reduce(merge_freq_dicts, freq_dicts, {})
+
+    #combined_freqs = reduce(merge_freq_dicts, freq_dicts, {})
+    print(f"Starting parallel merge of {len(freq_dicts)} dictionaries...")
+    combined_freqs = parallel_merge_freq_dicts(freq_dicts, pool)
+
+    pool.close()
+    pool.join()
     # print(f"Combined frequencies: {combined_freqs}")
 
     return combined_freqs
@@ -259,7 +277,9 @@ def find_chunk_boundaries(file: BinaryIO,
 
 def pre_tokenize_chunk(
         chunk: str,
-        special_pattern: re.Pattern | None) -> dict[tuple[bytes], int]:
+        special_pattern: re.Pattern | None,
+        chunk_index=0
+) -> dict[tuple[bytes], int]:
     """
     Regex pre-tokenizes the chunk.
     Splits first on special tokens, then uses PAT which is a global variable.
@@ -291,7 +311,32 @@ def pre_tokenize_chunk(
             # the value for the matching pre-token by 1.
             freqs[match_bytes] = freqs.get(match_bytes, 0) + 1
 
+    print(f"Pre-tokenization: finished pre-tokenizing chunk {chunk_index}.")
+
     return freqs
+
+
+def parallel_merge_freq_dicts(freq_dicts: list[dict], pool: mp.Pool) -> dict:
+    """
+    Hierarchically merges dictionaries by pairing them off and merging in parallel.
+    """
+    if not freq_dicts:
+        return {}
+
+    # Continue merging until only one dictionary remains
+    while len(freq_dicts) > 1:
+        # Group dictionaries into pairs: [(d1, d2), (d3, d4), ...]
+        pairs = [(freq_dicts[i], freq_dicts[i + 1]) for i in range(0, len(freq_dicts) - 1, 2)]
+
+        # If there's an odd number of dictionaries, save the last one for the next round
+        leftover = [freq_dicts[-1]] if len(freq_dicts) % 2 != 0 else []
+
+        # Merge pairs in parallel across the pool
+        # starmap allows passing multiple arguments (dict1, dict2) to the merge function
+        freq_dicts = pool.starmap(merge_freq_dicts, pairs) + leftover
+        print(f"Merge phase complete: {len(freq_dicts)} dictionaries remaining...")
+
+    return freq_dicts[0]
 
 
 def merge_freq_dicts(
@@ -301,11 +346,15 @@ def merge_freq_dicts(
     """
     Adds frequencies from dict2 into dict1.
     """
-    result = dict1.copy()
+    start_time = time.time()
+    #result = dict1.copy()
     for key, value in dict2.items():
-        result[key] = result.get(key, 0) + value
+        #result[key] = result.get(key, 0) + value
+        dict1[key] = dict1.get(key, 0) + value
 
-    return result
+    print(f"Pre-tokenization: merged 2 frequency dictionaries in {time.time() - start_time:.2f} seconds.")
+    #return result
+    return dict1
 
 
 def get_pair_freqs(
@@ -407,14 +456,18 @@ def merge(
 
 def write_merges(merges, outpath):
     """
-    Pickle the merges list to a binary file.
+    Write the merges list to a text file and a binary file.
     """
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    with open(outpath, "w", encoding="utf-8") as f:
-        for pair in merges:
-            # pair is typically (token_a, token_b)
-            # This writes them separated by a space
-            f.write(f"{pair[0]} {pair[1]}\n")
+    #with open(outpath, "w", encoding="utf-8") as f:
+    #    for pair in merges:
+    #        # pair is typically (token_a, token_b)
+    #        # This writes them separated by a space
+    #        f.write(f"{pair[0]} {pair[1]}\n")
+    #print(f"Saved {len(merges)} merges to {outpath}")
+
+    with open(outpath, "wb") as f:
+        pickle.dump(merges, f)
     print(f"Saved {len(merges)} merges to {outpath}")
 
 
@@ -423,20 +476,25 @@ def write_vocab(vocab, outpath):
     Pickle the vocab dict to a binary file.
     """
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    with open(outpath, "w", encoding="utf-8") as f:
-        for idx, token in vocab.items():
-            f.write(f"{idx}: {token}\n")
+    #with open(outpath, "w", encoding="utf-8") as f:
+    #    for idx, token in vocab.items():
+    #        f.write(f"{idx}: {token}\n")
+    #print(f"Saved vocabulary with {len(vocab)} tokens to {outpath}")
+
+    with open(outpath, "wb") as f:
+        pickle.dump(vocab, f)
     print(f"Saved vocabulary with {len(vocab)} tokens to {outpath}")
 
 
 if __name__ == "__main__":
     (vocab, merge) = train_bpe(
-        #input_path = "./data/TinyStoriesV2-GPT4-valid.txt",
+        input_path = "./data/TinyStoriesV2-GPT4-valid.txt",
         #input_path = "./data/TinyStoriesV2-GPT4-train.txt",
-        input_path  = "./data/owt_train.txt",
-        #vocab_size=10000,
-        vocab_size=32000,
+        #input_path  = "./data/owt_train.txt",
+        #input_path = "./data/owt_valid.txt",
+        vocab_size=10000,
+        #vocab_size=32000,
         special_tokens=["<|endoftext|>"],
-        merges_outpath="./out/merges.txt",
-        vocab_outpath="./out/vocab.txt"
+        merges_outpath="./out/merges.pkl",
+        vocab_outpath="./out/vocab.pkl"
     )
